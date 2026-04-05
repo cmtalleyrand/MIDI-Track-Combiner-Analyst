@@ -1,8 +1,81 @@
-
 import { Midi, Track } from '@tonejs/midi';
 import { ConversionOptions, MidiEventType, PianoRollTrackData } from '../../types';
 import { quantizeNotes, performInversion, performModalConversion, pruneOverlaps, performMelodicInversion, cropToRange } from './midiTransform';
 import { distributeToVoices } from './midiVoices';
+
+interface TempoTransformContext {
+    ppqRatio: number;
+    tickScale: number;
+    tempoScale: number;
+    isGlobalInversion: boolean;
+    maxTick: number;
+    cropEnabled: boolean;
+    cropStartTick: number;
+    cropEndTick: number;
+}
+
+function transformEventTicks(ticks: number, context: TempoTransformContext): number | null {
+    let transformedTicks = Math.round(ticks * context.ppqRatio);
+    transformedTicks = Math.round(transformedTicks * context.tickScale);
+
+    if (context.isGlobalInversion) {
+        transformedTicks = context.maxTick - transformedTicks;
+    }
+
+    if (context.cropEnabled) {
+        if (transformedTicks < context.cropStartTick || transformedTicks > context.cropEndTick) {
+            return null;
+        }
+        transformedTicks -= context.cropStartTick;
+    }
+
+    return transformedTicks;
+}
+
+function getTempoScale(options: ConversionOptions): number {
+    if (options.originalTempo <= 0 || options.tempo <= 0) return 1;
+    return options.tempo / options.originalTempo;
+}
+
+function buildTransformedTempoEvents(
+    sourceMidi: Midi,
+    destinationHeader: Midi['header'],
+    context: TempoTransformContext
+): Array<{ ticks: number; bpm: number; time?: number }> {
+    const sourceTempoEvents = sourceMidi.header.tempos;
+    if (!sourceTempoEvents || sourceTempoEvents.length === 0) {
+        return [{ ticks: 0, bpm: Math.max(1, destinationHeader.tempos[0]?.bpm || 120), time: 0 }];
+    }
+
+    const transformed = sourceTempoEvents
+        .map((event) => {
+            const ticks = transformEventTicks(event.ticks, context);
+            if (ticks === null) return null;
+            const bpm = Math.max(1, event.bpm * context.tempoScale);
+            return { ticks, bpm };
+        })
+        .filter((event): event is { ticks: number; bpm: number; time?: number } => event !== null)
+        .sort((a, b) => a.ticks - b.ticks);
+
+    if (transformed.length === 0 || transformed[0].ticks > 0) {
+        const fallbackBpm = Math.max(1, (sourceTempoEvents[0]?.bpm || 120) * context.tempoScale);
+        transformed.unshift({ ticks: 0, bpm: fallbackBpm });
+    }
+
+    const deduped: Array<{ ticks: number; bpm: number; time?: number }> = [];
+    transformed.forEach((event) => {
+        const existingIndex = deduped.findIndex((candidate) => candidate.ticks === event.ticks);
+        if (existingIndex >= 0) deduped[existingIndex] = event;
+        else deduped.push(event);
+    });
+
+    return deduped;
+}
+
+function applyTempoEvents(destinationHeader: Midi['header'], tempoEvents: Array<{ ticks: number; bpm: number; time?: number }>) {
+    destinationHeader.tempos = tempoEvents.map((event) => ({ ...event }));
+    destinationHeader.update();
+}
 
 export function copyAndTransformTrackEvents(
     sourceTrack: Track, 
@@ -15,9 +88,10 @@ export function copyAndTransformTrackEvents(
     const destPPQ = destinationHeader.ppq;
     const ppqRatio = destPPQ / sourcePPQ;
 
-    let timeScale = options.noteTimeScale;
-    if (options.tempoChangeMode === 'time' && options.originalTempo > 0 && options.tempo > 0) {
-        timeScale *= options.originalTempo / options.tempo;
+    const tempoScale = getTempoScale(options);
+    let tickScale = options.noteTimeScale;
+    if (options.tempoChangeMode === 'time') {
+        tickScale *= tempoScale;
     }
 
     // 1. Initial Copy, Transposition & PPQ Normalization
@@ -40,41 +114,27 @@ export function copyAndTransformTrackEvents(
         } as any;
     });
 
-    // 2. Filter Short Notes (On original timeframe, effectively dest timeframe now)
-    // Note: removeShortNotesThreshold should be calculated against the relevant PPQ. 
-    // In settings, it's calculated against original PPQ. We should scale it or re-calc it.
-    // However, usually we pass a threshold in ticks. If options.removeShortNotesThreshold is based on source PPQ, we scale it.
-    // For simplicity, we assume options passed here are consistent. 
-    // Actually, let's scale the threshold too if it was pre-calculated.
     const scaledThreshold = Math.round(options.removeShortNotesThreshold * ppqRatio);
     if (scaledThreshold > 0) {
         transformedNotes = transformedNotes.filter(n => n.durationTicks >= scaledThreshold);
     }
 
-    // 3. Quantize (On destination timeframe)
     transformedNotes = quantizeNotes(transformedNotes, options, destPPQ);
 
-    // 4. Apply Time Scaling (Augmentation/Diminution)
-    if (timeScale !== 1) {
+    if (tickScale !== 1) {
         transformedNotes = transformedNotes.map(n => ({
             ...n,
-            ticks: Math.round(n.ticks * timeScale),
-            durationTicks: Math.round(n.durationTicks * timeScale)
+            ticks: Math.round(n.ticks * tickScale),
+            durationTicks: Math.round(n.durationTicks * tickScale)
         }));
     }
 
     const maxTick = transformedNotes.length > 0 ? Math.max(...transformedNotes.map(n => n.ticks + n.durationTicks)) : 0;
     
-    // 5. Retrograde (Time Inversion)
     transformedNotes = performInversion(transformedNotes, options.inversionMode, destPPQ, options.timeSignature, maxTick);
-    
-    // 6. Melodic Inversion
     transformedNotes = performMelodicInversion(transformedNotes, options.melodicInversion, destPPQ, options.timeSignature);
-    
-    // 7. Modal Conversion
     transformedNotes = performModalConversion(transformedNotes, options);
 
-    // 8. Export Cropping
     const cropEnabled = options.exportRange.enabled;
     let cropStartTick = 0;
     let cropEndTick = Infinity;
@@ -87,28 +147,27 @@ export function copyAndTransformTrackEvents(
         transformedNotes = cropToRange(transformedNotes, options, destPPQ);
     }
 
-    const secondsPerTick = (60 / options.tempo) / destPPQ;
+    const tempoAtZero = destinationHeader.tempos[0]?.bpm || options.tempo;
+    const secondsPerTick = (60 / tempoAtZero) / destPPQ;
     transformedNotes = transformedNotes.map(n => ({ ...n, time: n.ticks * secondsPerTick, duration: n.durationTicks * secondsPerTick }));
     transformedNotes.forEach(note => destinationTrack.addNote(note));
     
     const isGlobalInversion = options.inversionMode === 'global';
     
     const transformEvent = (e: any) => {
-        // Normalize
-        let ticks = Math.round(e.ticks * ppqRatio);
-        
-        // Scale
-        ticks = Math.round(ticks * timeScale);
-        
-        if (isGlobalInversion) ticks = maxTick - ticks;
-        
-        // Handle Cropping shift for events
-        if (cropEnabled) {
-            if (ticks < cropStartTick || ticks > cropEndTick) return null; // Filter out
-            ticks = ticks - cropStartTick;
-        }
-        
-        return { ...e, ticks, time: ticks * secondsPerTick };
+        const transformedTicks = transformEventTicks(e.ticks, {
+            ppqRatio,
+            tickScale,
+            tempoScale,
+            isGlobalInversion,
+            maxTick,
+            cropEnabled,
+            cropStartTick,
+            cropEndTick
+        });
+
+        if (transformedTicks === null) return null;
+        return { ...e, ticks: transformedTicks, time: transformedTicks * secondsPerTick };
     };
 
     if (!eventsToDelete.has('controlChange')) {
@@ -125,7 +184,7 @@ export function copyAndTransformTrackEvents(
     }
     if (!eventsToDelete.has('programChange')) {
         ((sourceTrack as any).programChanges || []).forEach((pc: any) => { 
-            const t = transformEvent(pc);
+            const t = transformEvent(pc); 
             if (t) (destinationTrack as any).addProgramChange(pc.number, t.time); 
         });
     }
@@ -134,10 +193,20 @@ export function copyAndTransformTrackEvents(
 export function createPreviewMidi(originalMidi: Midi, trackId: number, eventsToDelete: Set<MidiEventType>, options: ConversionOptions): Midi {
     if (trackId < 0 || trackId >= originalMidi.tracks.length) throw new Error(`Track ${trackId} not found.`);
     
-    // Create fresh Midi (defaults to 480 PPQ)
     const newMidi = new Midi();
     if (originalMidi.header.name) newMidi.header.name = originalMidi.header.name;
-    newMidi.header.setTempo(options.tempo);
+
+    const tempoContext: TempoTransformContext = {
+        ppqRatio: 1,
+        tickScale: options.tempoChangeMode === 'time' ? options.noteTimeScale * getTempoScale(options) : options.noteTimeScale,
+        tempoScale: getTempoScale(options),
+        isGlobalInversion: false,
+        maxTick: 0,
+        cropEnabled: false,
+        cropStartTick: 0,
+        cropEndTick: Infinity
+    };
+    applyTempoEvents(newMidi.header, buildTransformedTempoEvents(originalMidi, newMidi.header, tempoContext));
     newMidi.header.timeSignatures = [{ ticks: 0, timeSignature: [options.timeSignature.numerator, options.timeSignature.denominator] }];
 
     const originalTrack = originalMidi.tracks[trackId];
@@ -152,7 +221,16 @@ export function createPreviewMidi(originalMidi: Midi, trackId: number, eventsToD
 
 export function getTransformedTrackDataForPianoRoll(originalMidi: Midi, trackId: number, options: ConversionOptions): PianoRollTrackData {
     const newMidi = new Midi();
-    newMidi.header.setTempo(options.tempo);
+    applyTempoEvents(newMidi.header, buildTransformedTempoEvents(originalMidi, newMidi.header, {
+        ppqRatio: 1,
+        tickScale: options.tempoChangeMode === 'time' ? options.noteTimeScale * getTempoScale(options) : options.noteTimeScale,
+        tempoScale: getTempoScale(options),
+        isGlobalInversion: false,
+        maxTick: 0,
+        cropEnabled: false,
+        cropStartTick: 0,
+        cropEndTick: Infinity
+    }));
     newMidi.header.timeSignatures = [{ ticks: 0, timeSignature: [options.timeSignature.numerator, options.timeSignature.denominator] }];
 
     const originalTrack = originalMidi.tracks[trackId];
@@ -178,12 +256,23 @@ export async function combineAndDownload(originalMidi: Midi, trackIds: number[],
     
     const newMidi = new Midi();
     if (originalMidi.header.name) newMidi.header.name = originalMidi.header.name;
-    newMidi.header.setTempo(options.tempo);
+
+    const baseTickScale = options.tempoChangeMode === 'time' ? options.noteTimeScale * getTempoScale(options) : options.noteTimeScale;
+    const tempoEvents = buildTransformedTempoEvents(originalMidi, newMidi.header, {
+        ppqRatio: newMidi.header.ppq / originalMidi.header.ppq,
+        tickScale: baseTickScale,
+        tempoScale: getTempoScale(options),
+        isGlobalInversion: false,
+        maxTick: 0,
+        cropEnabled: options.exportRange.enabled,
+        cropStartTick: options.exportRange.enabled ? (options.exportRange.startMeasure - 1) * (newMidi.header.ppq * 4 * (options.timeSignature.numerator / options.timeSignature.denominator)) : 0,
+        cropEndTick: options.exportRange.enabled ? options.exportRange.endMeasure * (newMidi.header.ppq * 4 * (options.timeSignature.numerator / options.timeSignature.denominator)) : Infinity
+    });
+    applyTempoEvents(newMidi.header, tempoEvents);
     newMidi.header.timeSignatures = [{ ticks: 0, timeSignature: [options.timeSignature.numerator, options.timeSignature.denominator] }];
 
     const selectedTrackIds = new Set(trackIds);
 
-    // Strategy 1: Keep Separate Tracks
     if (options.outputStrategy === 'separate_tracks') {
         originalMidi.tracks.forEach((track, index) => {
             if (selectedTrackIds.has(index)) {
@@ -201,7 +290,6 @@ export async function combineAndDownload(originalMidi: Midi, trackIds: number[],
             }
         });
     } 
-    // Strategy 2 & 3: Combine first (then optionally separate by voice)
     else {
         const combinedTrack = newMidi.addTrack();
         const first = originalMidi.tracks.find((_, index) => selectedTrackIds.has(index));
@@ -223,10 +311,9 @@ export async function combineAndDownload(originalMidi: Midi, trackIds: number[],
             combinedTrack.notes = pruneOverlaps(combinedTrack.notes, pruneThresholdTicks);
         }
 
-        // Strategy 3: Separate Voices
         if (options.outputStrategy === 'separate_voices') {
             const voices = distributeToVoices(combinedTrack.notes, options) as any[][];
-            newMidi.tracks.pop(); // Remove combined track
+            newMidi.tracks.pop();
             voices.forEach((vNotes, idx) => {
                 const voiceTrack = newMidi.addTrack();
                 voiceTrack.name = `${combinedTrack.name} - Voice ${idx + 1}`;
